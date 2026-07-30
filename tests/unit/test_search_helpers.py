@@ -144,6 +144,147 @@ def test_keyword_clean_query_removes_stopwords_and_caps_length(test_ctx):
     assert len(cleaned_long) <= 300
 
 
+def test_keyword_search_filters_external_id_properties_after_cirrus_search(test_ctx, monkeypatch):
+    """Validate keyword property search preserves Cirrus search and filters datatypes after."""
+    _, KeywordSearch, _ = _service_classes()
+    keyword_module = importlib.import_module("wikidatasearch.services.search.KeywordSearch")
+    calls = []
+
+    class _Response:
+        """Minimal response stub."""
+
+        def __init__(self, payload):
+            """Store the JSON payload."""
+            self.payload = payload
+
+        def raise_for_status(self):
+            """Match the requests response API used by the search code."""
+            return None
+
+        def json(self):
+            """Return the configured JSON payload."""
+            return self.payload
+
+    def _fake_get(url, params=None, headers=None):
+        """Return Cirrus hits first, then property datatype metadata."""
+        calls.append({"url": url, "params": params, "headers": headers})
+        if url.endswith("/w/index.php"):
+            return _Response(
+                {
+                    "__main__": {
+                        "result": {
+                            "hits": {
+                                "hits": [
+                                    {"_source": {"title": "P214"}},
+                                    {"_source": {"title": "P31"}},
+                                    {"_source": {"title": "P625"}},
+                                ]
+                            }
+                        }
+                    }
+                }
+            )
+
+        return _Response(
+            {
+                "entities": {
+                    "P214": {"type": "property", "datatype": "external-id", "id": "P214"},
+                    "P31": {"type": "property", "datatype": "wikibase-item", "id": "P31"},
+                    "P625": {"type": "property", "datatype": "globe-coordinate", "id": "P625"},
+                }
+            }
+        )
+
+    monkeypatch.setattr(keyword_module.requests, "get", _fake_get)
+
+    keyword = KeywordSearch()
+    results = keyword.search(
+        "instance",
+        filter={
+            "metadata.IsProperty": True,
+            "metadata.DataType": {"$ne": "external-id"},
+        },
+        K=2,
+    )
+
+    assert results == ["P31", "P625"]
+    assert calls[0]["url"] == "https://www.wikidata.org/w/index.php"
+    assert calls[0]["params"]["srlimit"] == 10
+    assert calls[1]["url"] == "https://www.wikidata.org/w/api.php"
+    assert calls[1]["params"]["action"] == "wbgetentities"
+    assert calls[1]["params"]["ids"] == "P214|P31|P625"
+
+
+def test_keyword_search_filters_external_id_direct_pid(test_ctx, monkeypatch):
+    """Validate direct PID search also respects the external-id filter."""
+    _, KeywordSearch, _ = _service_classes()
+    keyword_module = importlib.import_module("wikidatasearch.services.search.KeywordSearch")
+
+    class _Response:
+        """Minimal response stub."""
+
+        def raise_for_status(self):
+            """Match the requests response API used by the search code."""
+            return None
+
+        def json(self):
+            """Return datatype metadata for one external-id property."""
+            return {"entities": {"P214": {"type": "property", "datatype": "external-id", "id": "P214"}}}
+
+    monkeypatch.setattr(keyword_module.requests, "get", lambda *_args, **_kwargs: _Response())
+
+    keyword = KeywordSearch()
+    results = keyword.search(
+        "P214",
+        filter={
+            "metadata.IsProperty": True,
+            "metadata.DataType": {"$ne": "external-id"},
+        },
+        K=1,
+    )
+
+    assert results == []
+
+
+def test_keyword_property_datatype_lookup_batches_ids(test_ctx, monkeypatch):
+    """Validate datatype lookups are split into Wikidata API-sized batches."""
+    _, KeywordSearch, _ = _service_classes()
+    keyword_module = importlib.import_module("wikidatasearch.services.search.KeywordSearch")
+    calls = []
+
+    class _Response:
+        """Minimal response stub."""
+
+        def __init__(self, ids):
+            """Store the requested property IDs."""
+            self.ids = ids
+
+        def raise_for_status(self):
+            """Match the requests response API used by the search code."""
+            return None
+
+        def json(self):
+            """Return datatype metadata for requested properties."""
+            return {"entities": {pid: {"datatype": "wikibase-item"} for pid in self.ids}}
+
+    def _fake_get(url, params=None, headers=None):
+        """Capture batched datatype requests."""
+        ids = params["ids"].split("|")
+        calls.append(ids)
+        return _Response(ids)
+
+    monkeypatch.setattr(keyword_module.requests, "get", _fake_get)
+
+    keyword = KeywordSearch()
+    datatypes = keyword._get_property_datatypes([f"P{i}" for i in range(1, 52)])
+
+    assert len(calls) == 2
+    assert len(calls[0]) == 50
+    assert calls[1] == ["P51"]
+    assert datatypes["P1"] == "wikibase-item"
+    assert datatypes["P51"] == "wikibase-item"
+
+
 def test_vector_find_routes_pid_filters_to_property_collection(test_ctx):
     """Validate PID filters route to the property vector database."""
     _, _, VectorSearch = _service_classes()

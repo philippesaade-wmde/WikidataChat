@@ -33,7 +33,7 @@ class KeywordSearch(Search):
 
         # If the query is a QID or PID, return it directly.
         if re.fullmatch(r"[PQ]\d+", query):
-            return [query]
+            return self._filter_external_id_properties([query], filter)[:K]
 
         query = self._clean_query(query, lang)
 
@@ -63,7 +63,40 @@ class KeywordSearch(Search):
         results = results.json()["__main__"]["result"]["hits"]["hits"]
         qids = [item["_source"]["title"] for item in results]
 
+        excludes_external_ids = filter.get("metadata.IsProperty", False) and \
+            filter.get("metadata.DataType") == {"$ne": "external-id"}
+        if excludes_external_ids:
+            pids = [qid for qid in qids if qid.startswith("P")]
+            datatypes = self._get_property_datatypes(pids)
+            qids = [qid for qid in qids if not qid.startswith("P") or datatypes.get(qid) != "external-id"]
+
         return qids[:K]
+
+    def _get_property_datatypes(self, property_ids: list[str]) -> dict[str, str]:
+        """Fetch Wikidata property datatypes in API-sized batches."""
+        headers = {"User-Agent": "Wikidata Vector Database (embedding@wikimedia.de)"}
+        datatypes = {}
+
+        for i in range(0, len(property_ids), 50):
+            params = {
+                "action": "wbgetentities",
+                "ids": "|".join(property_ids[i : i + 50]),
+                "props": "datatype",
+                "format": "json",
+            }
+            results = requests.get("https://www.wikidata.org/w/api.php", params=params, headers=headers)
+            results.raise_for_status()
+
+            entities = results.json().get("entities", {})
+            datatypes.update(
+                {
+                    pid: entity.get("datatype")
+                    for pid, entity in entities.items()
+                    if isinstance(entity, dict) and entity.get("datatype")
+                }
+            )
+
+        return datatypes
 
     def _clean_query(self, query: str, lang: str) -> str:
         """Remove stop words and split the query into individual terms separated by "OR" for the search.
