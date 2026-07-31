@@ -63,8 +63,9 @@ class KeywordSearch(Search):
         results = results.json()["__main__"]["result"]["hits"]["hits"]
         qids = [item["_source"]["title"] for item in results]
 
-        excludes_external_ids = filter.get("metadata.IsProperty", False) and \
-            filter.get("metadata.DataType") == {"$ne": "external-id"}
+        excludes_external_ids = filter.get("metadata.IsProperty", False) and filter.get("metadata.DataType") == {
+            "$ne": "external-id"
+        }
         if excludes_external_ids:
             pids = [qid for qid in qids if qid.startswith("P")]
             datatypes = self._get_property_datatypes(pids)
