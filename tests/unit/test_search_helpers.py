@@ -177,7 +177,6 @@ def test_keyword_search_filters_external_id_properties_after_cirrus_search(test_
                                 "hits": [
                                     {"_source": {"title": "P214"}},
                                     {"_source": {"title": "P31"}},
-                                    {"_source": {"title": "P625"}},
                                 ]
                             }
                         }
@@ -190,7 +189,6 @@ def test_keyword_search_filters_external_id_properties_after_cirrus_search(test_
                 "entities": {
                     "P214": {"type": "property", "datatype": "external-id", "id": "P214"},
                     "P31": {"type": "property", "datatype": "wikibase-item", "id": "P31"},
-                    "P625": {"type": "property", "datatype": "globe-coordinate", "id": "P625"},
                 }
             }
         )
@@ -207,31 +205,17 @@ def test_keyword_search_filters_external_id_properties_after_cirrus_search(test_
         K=2,
     )
 
-    assert results == ["P31", "P625"]
+    assert results == ["P31"]
     assert calls[0]["url"] == "https://www.wikidata.org/w/index.php"
-    assert calls[0]["params"]["srlimit"] == 10
+    assert calls[0]["params"]["srlimit"] == 2
     assert calls[1]["url"] == "https://www.wikidata.org/w/api.php"
     assert calls[1]["params"]["action"] == "wbgetentities"
-    assert calls[1]["params"]["ids"] == "P214|P31|P625"
+    assert calls[1]["params"]["ids"] == "P214|P31"
 
 
-def test_keyword_search_filters_external_id_direct_pid(test_ctx, monkeypatch):
-    """Validate direct PID search also respects the external-id filter."""
+def test_keyword_search_returns_direct_pid_regardless_of_filter(test_ctx):
+    """Validate direct PID searches bypass result filters."""
     _, KeywordSearch, _ = _service_classes()
-    keyword_module = importlib.import_module("wikidatasearch.services.search.KeywordSearch")
-
-    class _Response:
-        """Minimal response stub."""
-
-        def raise_for_status(self):
-            """Match the requests response API used by the search code."""
-            return None
-
-        def json(self):
-            """Return datatype metadata for one external-id property."""
-            return {"entities": {"P214": {"type": "property", "datatype": "external-id", "id": "P214"}}}
-
-    monkeypatch.setattr(keyword_module.requests, "get", lambda *_args, **_kwargs: _Response())
 
     keyword = KeywordSearch()
     results = keyword.search(
@@ -243,7 +227,7 @@ def test_keyword_search_filters_external_id_direct_pid(test_ctx, monkeypatch):
         K=1,
     )
 
-    assert results == []
+    assert results == ["P214"]
 
 
 def test_keyword_property_datatype_lookup_batches_ids(test_ctx, monkeypatch):
@@ -285,28 +269,24 @@ def test_keyword_property_datatype_lookup_batches_ids(test_ctx, monkeypatch):
     assert datatypes["P51"] == "wikibase-item"
 
 
-def test_vector_find_routes_pid_filters_to_property_collection(test_ctx):
-    """Validate PID filters route to the property vector database."""
+def test_vector_find_uses_configured_collection(test_ctx):
+    """Validate VectorSearch always queries its configured collection."""
     _, _, VectorSearch = _service_classes()
 
     class _FakeCollection:
         """Minimal collection stub that records find calls."""
 
-        def __init__(self, name):
-            """Store the collection name and initialize captured calls."""
-            self.name = name
+        def __init__(self):
+            """Initialize captured calls."""
             self.calls = []
 
         def find(self, *args, **kwargs):
             """Capture call arguments and return one deterministic row."""
             self.calls.append({"args": args, "kwargs": kwargs})
-            if self.name == "property":
-                return [{"metadata": {"PID": "P31"}, "$similarity": 0.9}]
-            return [{"metadata": {"QID": "Q42"}, "$similarity": 0.9}]
+            return [{"metadata": {"PID": "P31"}, "$similarity": 0.9}]
 
     vector = VectorSearch.__new__(VectorSearch)
-    vector.icollection = _FakeCollection("item")
-    vector.pcollection = _FakeCollection("property")
+    vector.collection = _FakeCollection()
     vector.max_K = 50
 
     rows = vector.find(
@@ -316,12 +296,12 @@ def test_vector_find_routes_pid_filters_to_property_collection(test_ctx):
     )
 
     assert rows and rows[0]["metadata"]["PID"] == "P31"
-    assert len(vector.pcollection.calls) == 1
-    assert len(vector.icollection.calls) == 0
+    assert len(vector.collection.calls) == 1
+    assert vector.collection.calls[0]["args"][0] == {"metadata.PID": {"$in": ["P31"]}}
 
 
-def test_get_embedding_by_id_marks_property_ids_as_property_filter(test_ctx):
-    """Validate that property lookups build the correct filter before querying."""
+def test_get_embedding_by_id_uses_configured_id_field(test_ctx):
+    """Validate that ID lookups use the field configured for the collection."""
     _, _, VectorSearch = _service_classes()
 
     captured = {}
@@ -332,11 +312,11 @@ def test_get_embedding_by_id_marks_property_ids_as_property_filter(test_ctx):
         return [{"metadata": {"PID": "P31"}, "$vector": [0.1, 0.2]}]
 
     vector = VectorSearch.__new__(VectorSearch)
+    vector.id_field = "PID"
     vector.find = _fake_find
 
     item, embedding = vector.get_embedding_by_id("P31")
 
     assert item["metadata"]["PID"] == "P31"
     assert embedding == [0.1, 0.2]
-    assert captured["metadata.PID"] == "P31"
-    assert captured["metadata.IsProperty"] is True
+    assert captured == {"metadata.PID": "P31"}

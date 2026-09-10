@@ -31,11 +31,62 @@ class HybridSearch(Search):
         self.vectordb_langs = vectordb_langs
 
         self.vectorsearch = {
-            lang: VectorSearch(api_keys, collection, lang, embedding_model=self.embedding_model, max_K=max_K)
-            for lang in vectordb_langs
+            "items": {
+                lang: VectorSearch(
+                    api_keys,
+                    f"{collection}_items_{lang}",
+                    id_field="QID",
+                    embedding_model=self.embedding_model,
+                    max_K=max_K,
+                )
+                for lang in vectordb_langs
+            },
+            "properties": {
+                lang: VectorSearch(
+                    api_keys,
+                    f"{collection}_properties_{lang}",
+                    id_field="PID",
+                    embedding_model=self.embedding_model,
+                    max_K=max_K,
+                )
+                for lang in vectordb_langs
+            },
         }
         self.keywordsearch = KeywordSearch()
         self.translator = Translator(dest_lang)
+
+    def _search_vector_shard(
+        self,
+        vectorsearch: VectorSearch,
+        query: str,
+        query_filter: dict,
+        embedding: list | None,
+        lang: str,
+        K: int,
+        return_vectors: bool,
+    ) -> list:
+        """Search one target shard, resolving ID embeddings from the matching entity collection."""
+        exact_match = None
+        shard_embedding = embedding
+
+        if shard_embedding is None and re.fullmatch(r"[PQ]\d+", query):
+            entity_type = "properties" if query.startswith("P") else "items"
+            embedding_search = self.vectorsearch[entity_type][lang]
+            shard_embedding, resolved_match = embedding_search.calculate_embedding(query, lang=lang)
+            if shard_embedding is None:
+                return []
+            if query.startswith(vectorsearch.id_field[0]):
+                exact_match = resolved_match
+
+        return vectorsearch.search(
+            query,
+            filter=query_filter,
+            embedding=shard_embedding,
+            lang=lang,
+            K=K,
+            return_vectors=return_vectors,
+            exact_match=exact_match,
+        )
 
     def search(
         self,
@@ -65,11 +116,23 @@ class HybridSearch(Search):
         """
         query_filter = dict(filter or {})
         is_id = re.fullmatch(r"[PQ]\d+", query)
+        if query_filter.get("metadata.IsProperty", False):
+            vectorsearch = self.vectorsearch["properties"]
+        elif query_filter.get("metadata.IsItem", False):
+            vectorsearch = self.vectorsearch["items"]
+        elif "metadata.PID" in query_filter:
+            vectorsearch = self.vectorsearch["properties"]
+        else:
+            vectorsearch = self.vectorsearch["items"]
+
+        vector_filter = query_filter.copy()
+        vector_filter.pop("metadata.IsItem", None)
+        vector_filter.pop("metadata.IsProperty", None)
 
         lang = (lang or "all").lower()
         vector_query = query
 
-        if lang != "all" and lang not in self.vectorsearch:
+        if lang != "all" and lang not in vectorsearch:
             # Translate only if we are about to compute embedding here
             if not is_id and embedding is None:
                 vector_query = self.translator.translate(query, src_lang=lang)
@@ -79,22 +142,23 @@ class HybridSearch(Search):
         if not is_id and embedding is None:
             embedding = self.embedding_model.embed_query(vector_query)
 
-        num_shards = sum([int(vdblang == lang or lang == "all") for vdblang, _ in self.vectorsearch.items()])
+        num_shards = sum([int(vdblang == lang or lang == "all") for vdblang, _ in vectorsearch.items()])
         num_shards = max(num_shards, 1)
         vs_K = max(10, min(vs_K, (vs_K * 2 + 1) // num_shards))
 
         with ThreadPoolExecutor(max_workers=4) as ex:
             vfunc = []
-            for vdblang, vdb in self.vectorsearch.items():
+            for vdblang, vdb in vectorsearch.items():
                 if vdblang == lang or lang == "all":
                     func = ex.submit(
-                        vdb.search,
+                        self._search_vector_shard,
+                        vdb,
                         vector_query,
-                        filter=query_filter.copy(),
-                        embedding=embedding,
-                        lang=vdblang,
-                        K=vs_K,
-                        return_vectors=return_vectors,
+                        vector_filter.copy(),
+                        embedding,
+                        vdblang,
+                        vs_K,
+                        return_vectors,
                     )
                     vfunc.append((vdblang, func))
 
@@ -112,7 +176,7 @@ class HybridSearch(Search):
             keyword_results = kfunc.result()
 
         # Combine results using Reciprocal Rank Fusion
-        combined_results = [(self.vectorsearch[vdblang].name, vector_results[vdblang]) for vdblang, _ in vfunc]
+        combined_results = [(vectorsearch[vdblang].name, vector_results[vdblang]) for vdblang, _ in vfunc]
         combined_results.append((self.keywordsearch.name, keyword_results))
         results = self.reciprocal_rank_fusion(combined_results)
         results = results[:vs_K]
@@ -219,7 +283,7 @@ class HybridSearch(Search):
         lang = (lang or "all").lower()
         vector_query = query
 
-        if lang != "all" and lang not in self.vectorsearch:
+        if lang != "all" and lang not in self.vectorsearch["items"]:
             # Translate only if we are about to compute embedding here
             if not is_id and embedding is None:
                 vector_query = self.translator.translate(query, src_lang=lang)
@@ -229,21 +293,27 @@ class HybridSearch(Search):
         if not is_id and embedding is None:
             embedding = self.embedding_model.embed_query(vector_query)
 
+        qids = list(set(qids))
+        q_list = [qid for qid in qids if qid.startswith("Q")]
+        p_list = [pid for pid in qids if pid.startswith("P")]
+
         with ThreadPoolExecutor(max_workers=4) as ex:
             vfunc = []
-            for vdblang, vdb in self.vectorsearch.items():
+            for vdblang in self.vectorsearch["items"]:
                 if vdblang == lang or lang == "all":
                     func = ex.submit(
-                        vdb.get_similarity_scores,
+                        self._get_similarity_scores_for_shard,
                         vector_query,
-                        qids,
-                        embedding=embedding,
-                        return_vectors=return_vectors,
-                        return_text=return_text,
+                        q_list,
+                        p_list,
+                        embedding,
+                        vdblang,
+                        return_vectors,
+                        return_text,
                     )
                     vfunc.append((vdblang, func))
 
-            vector_results = [item for _, f in vfunc for item in f.result()]
+            vector_results = [item for _, future in vfunc for item in future.result()]
 
         best_by_id = {}
         for item in vector_results:
@@ -256,6 +326,53 @@ class HybridSearch(Search):
 
         results = sorted(best_by_id.values(), key=lambda x: x.get("similarity_score", 0.0), reverse=True)
         return results[: len(qids)]
+
+    def _get_similarity_scores_for_shard(
+        self,
+        query: str,
+        qids: list,
+        pids: list,
+        embedding: list | None,
+        lang: str,
+        return_vectors: bool,
+        return_text: bool,
+    ) -> list:
+        """Score item and property IDs in their respective collections for one language shard."""
+        shard_embedding = embedding
+        if shard_embedding is None:
+            entity_type = "properties" if query.startswith("P") else "items"
+            embedding_search = self.vectorsearch[entity_type][lang]
+            shard_embedding, _ = embedding_search.calculate_embedding(
+                query,
+                lang="all",
+                return_text=return_text,
+            )
+
+        if shard_embedding is None:
+            return []
+
+        results = []
+        if qids:
+            results.extend(
+                self.vectorsearch["items"][lang].get_similarity_scores(
+                    query,
+                    qids,
+                    embedding=shard_embedding,
+                    return_vectors=return_vectors,
+                    return_text=return_text,
+                )
+            )
+        if pids:
+            results.extend(
+                self.vectorsearch["properties"][lang].get_similarity_scores(
+                    query,
+                    pids,
+                    embedding=shard_embedding,
+                    return_vectors=return_vectors,
+                    return_text=return_text,
+                )
+            )
+        return results
 
     @staticmethod
     def reciprocal_rank_fusion(results: list, k: int = 50) -> list:
