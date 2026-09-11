@@ -133,10 +133,12 @@ def _make_search(VectorSearch, api_keys, lang=None, max_k=50):
     """Get or create a cached vector search instance."""
     key = (lang, max_k)
     if key not in SEARCH_CACHE:
+        collection = api_keys["ASTRA_DB_COLLECTION"]
+        if lang:
+            collection = f"{collection}_items_{lang}"
         SEARCH_CACHE[key] = VectorSearch(
             api_keys=api_keys,
-            collection=api_keys["ASTRA_DB_COLLECTION"],
-            lang=lang,
+            collection=collection,
             max_K=max_k,
         )
     return SEARCH_CACHE[key]
@@ -164,7 +166,7 @@ def _v1_vector_search(VectorSearch, api_keys, query, K=50, max_k=None):
     if embedding is None:
         return []
     return search.find(
-        filter={"metadata.IsItem": True},
+        filter={},
         sort={"$vector": embedding},
         projection={"metadata": 1},
         limit=K,
@@ -178,7 +180,7 @@ def _v2_vector_search(VectorSearch, api_keys, query, langs=None, K=50, max_k=Non
     max_k = max_k or K
     searches = {lang: _make_search(VectorSearch, api_keys, lang=lang, max_k=max_k) for lang in langs}
     embedding = next(iter(searches.values())).embedding_model.embed_query(query)
-    search_filter = {"metadata.IsItem": True}
+    search_filter = {}
 
     with ThreadPoolExecutor(max_workers=len(langs)) as ex:
         futures = [
@@ -203,7 +205,7 @@ def _v1_vector_search_lang(VectorSearch, api_keys, query, lang="en", K=50, max_k
     if embedding is None:
         return []
     return search.find(
-        filter={"metadata.IsItem": True, "metadata.Language": lang},
+        filter={"metadata.Language": lang},
         sort={"$vector": embedding},
         projection={"metadata": 1},
         limit=K,
@@ -218,7 +220,7 @@ def _v2_vector_search_lang(VectorSearch, api_keys, query, lang="en", K=50, max_k
     if embedding is None:
         return []
     rows = search.find(
-        filter={"metadata.IsItem": True},
+        filter={},
         sort={"$vector": embedding},
         projection={"metadata": 1},
         limit=K,

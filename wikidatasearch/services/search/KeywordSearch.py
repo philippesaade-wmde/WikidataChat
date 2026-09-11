@@ -33,7 +33,7 @@ class KeywordSearch(Search):
 
         # If the query is a QID or PID, return it directly.
         if re.fullmatch(r"[PQ]\d+", query):
-            return self._filter_external_id_properties([query], filter)[:K]
+            return [query]
 
         query = self._clean_query(query, lang)
 
